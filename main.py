@@ -48,6 +48,7 @@ class Backend(QObject):
     channelTypeChanged = Signal()
     # --- NEW SIGNAL ---
     frozenProcessesChanged = Signal()
+    processStatsChanged = Signal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -72,6 +73,8 @@ class Backend(QObject):
         
         # --- NEW PROPERTY ---
         self._frozen_processes: List[int] = []
+        self._process_stats = []
+        self._psutil_processes = {}
         
         # Timer to pull logs from the log_queue
         self.log_timer = QTimer(self)
@@ -121,6 +124,32 @@ class Backend(QObject):
     def frozenProcesses(self):
         return self._frozen_processes
 
+    @Property("QVariantList", notify=processStatsChanged)
+    def processStats(self):
+        return self._process_stats
+
+    def refresh_process_stats(self):
+        readings = []
+        for i, worker in enumerate(self.processes):
+            pid = worker.pid
+            cpu = None
+            state = "Stopped"
+            if pid is not None:
+                try:
+                    proc = self._psutil_processes.get(pid)
+                    if proc is None:
+                        proc = psutil.Process(pid)
+                        proc.cpu_percent(interval=None)  # Prime nonblocking CPU sampling
+                        self._psutil_processes[pid] = proc
+                    cpu = round(proc.cpu_percent(interval=None), 1)
+                    state = proc.status().capitalize()
+                except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+                    self._psutil_processes.pop(pid, None)
+            readings.append({"name": f"P{i}", "pid": str(pid) if pid is not None else "—",
+                             "cpu": cpu, "state": state})
+        self._process_stats = readings
+        self.processStatsChanged.emit()
+
     # --- QML Slots ---
 
     @Slot(int, int)
@@ -132,6 +161,9 @@ class Backend(QObject):
         self.log_queue = mp.Queue()
         self.control_queues = [mp.Queue() for _ in range(num_procs)]
         self.processes = []
+        self._psutil_processes.clear()
+        self._process_stats = []
+        self.processStatsChanged.emit()
         
         ipc_map = {0: PipeChannel, 1: QueueChannel, 2: SharedMemoryChannel}
         self.channel = ipc_map.get(ipc_index, PipeChannel)()
@@ -175,6 +207,7 @@ class Backend(QObject):
             p.start()
 
         self._running = True
+        self.refresh_process_stats()
         self.runningChanged.emit()
         self.update_status("Running...")
         self.start_time = time.time()
@@ -201,6 +234,9 @@ class Backend(QObject):
         
         self.processes = []
         self.control_queues = []
+        self._psutil_processes.clear()
+        self._process_stats = []
+        self.processStatsChanged.emit()
         
         self._running = False
         self.runningChanged.emit()
@@ -300,6 +336,8 @@ class Backend(QObject):
 
     def update_stats(self):
         """Update performance metrics and check for diagnostic alerts."""
+        if self._running:
+            self.refresh_process_stats()
         if self._running:
             # Update IPC status
             if self.channel:
