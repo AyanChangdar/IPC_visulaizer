@@ -1,80 +1,47 @@
-import time, random
-import multiprocessing as mp
-from typing import Optional
+"""Entry point for the simulator's multiprocessing workers."""
 
-from ipc_engine import IPCChannel
-from diagnostics import Diagnostics
+import random
+import time
+from multiprocessing.connection import wait
 
-def process_worker(
-    pid: int,
-    num_procs: int,
-    channel: IPCChannel,
-    control_q: mp.Queue,
-    log_q: mp.Queue,
-    diag: Optional[Diagnostics] = None,
-    deadlock_mode: bool = False,
-    lock_A: Optional[mp.Lock] = None, 
-    lock_B: Optional[mp.Lock] = None
-):
-    """
-    The target function for each simulated process.
-    It sends and receives messages, simulating work.
-    """
-    log = lambda msg: log_q.put(f"[P{pid}] {msg}")
+from diagnostics import LockWait
+
+
+def process_worker(index, num_procs, channel, stop_reader, log_queue, deadlock=None):
+    def log(message):
+        log_queue.put(f"[P{index}] {message}")
+
     log("Started.")
+    if deadlock is not None and index in (2, 3):
+        locks, both_holding = deadlock
+        own = index - 2
+        other = 1 - own
+        first, second = "AB"[own], "AB"[other]
 
-    if deadlock_mode:
-        if pid == 2:
-            log(f"DEADLOCK_MODE (P{pid}): Acquiring Lock A...")
-            lock_A.acquire()
-            log(f"DEADLOCK_MODE (P{pid}): Acquired Lock A. Simulating work...")
-            time.sleep(1) # Give P3 time to grab Lock B
-            log(f"DEADLOCK_MODE (P{pid}): Trying to acquire Lock B...")
-            lock_B.acquire() # This will block forever
-            log(f"DEADLOCK_MODE (P{pid}): Acquired Lock B.")
-            lock_B.release()
-            lock_A.release()
+        with locks[own]:
+            log(f"Acquired Lock {first}.")
+            both_holding.wait()
+            if not locks[other].acquire(block=False):
+                log_queue.put(LockWait(index, first, second))
+                locks[other].acquire()
+            locks[other].release()
 
-        elif pid == 3:
-            log(f"DEADLOCK_MODE (P{pid}): Acquiring Lock B...")
-            lock_B.acquire()
-            log(f"DEADLOCK_MODE (P{pid}): Acquired Lock B. Simulating work...")
-            time.sleep(1) # Give P2 time to grab Lock A
-            log(f"DEADLOCK_MODE (P{pid}): Trying to acquire Lock A...")
-            lock_A.acquire() # This will block forever
-            log(f"DEADLOCK_MODE (P{pid}): Acquired Lock A.")
-            lock_A.release()
-            lock_B.release()
+    pending = None
+    next_send = time.monotonic() + random.uniform(0.5, 2.0)
+    try:
+        while not wait([stop_reader], timeout=0.01):
+            message = channel.recv(index)
+            if message is not None:
+                log_queue.put((message, time.time() - message.timestamp))
 
-    # Normal operation
-    last_send_time = time.time()
-    while True:
-        try:
-            if not control_q.empty() and control_q.get() == "STOP":
-                log("Stopping.")
-                break
+            if pending is None and num_procs > 1 and time.monotonic() >= next_send:
+                dst = (index + random.randrange(1, num_procs)) % num_procs
+                pending = (dst, f"Hello from P{index}")
+            if pending is not None and channel.send(index, *pending):
+                pending = None
+                next_send = time.monotonic() + random.uniform(0.5, 2.0)
 
-            msg = channel.recv(pid, diag)
-            if msg:
-                latency = time.time() - msg.timestamp
-                log(f"Received '{msg.data}' from P{msg.src}, latency={latency:.4f}s")
-                time.sleep(random.uniform(0.05, 0.2))
-
-            if time.time() - last_send_time > random.uniform(0.5, 2.0):
-                dst = random.randint(0, num_procs - 1)
-                if dst == pid:
-                    dst = (pid + 1) % num_procs
-
-                data = f"Hello from P{pid}"
-                log(f"Sending '{data}' to P{dst}")
-                channel.send(pid, data)
-                last_send_time = time.time()
-
-            time.sleep(0.01)
-
-        except (BrokenPipeError, EOFError):
-            log("Channel closed. Exiting.")
-            break
-        except Exception as e:
-            log(f"ERROR: {e}")
-            break
+    except (BrokenPipeError, EOFError):
+        log("Channel closed. Exiting.")
+    finally:
+        log("Stopping.")

@@ -1,66 +1,62 @@
-"""Headless runner for quick smoke tests and CI.
+"""Exercise the same backend as the GUI using a headless Qt event loop."""
 
-Starts a short simulation without any GUI. This script spawns a few
-processes that execute `worker.process_worker` and collects logs into a
-timestamped file.
-"""
 import argparse
 import multiprocessing as mp
 import time
-from ipc_engine import QueueChannel
-from diagnostics import Diagnostics
-from worker import process_worker
+
+from PySide6.QtCore import QCoreApplication, QTimer
+
+from main import Backend
 
 
-def run_headless(num_procs: int, seconds: int, deadlock: bool = False):
-    log_q = mp.Queue()
-    control_queues = [mp.Queue() for _ in range(num_procs)]
-    channel = QueueChannel()
-    diagnostics = Diagnostics() if isinstance(channel, QueueChannel) else None
+def run_headless(num_procs, seconds, deadlock=False, ipc_index=1, stdout=False):
+    app = QCoreApplication.instance() or QCoreApplication([])
+    backend = Backend()
 
-    procs = []
-    for i in range(num_procs):
-        p = mp.Process(
-            target=process_worker,
-            args=(i, num_procs, channel, control_queues[i], log_q, diagnostics, deadlock),
-            daemon=True,
-        )
-        procs.append(p)
-        p.start()
+    def report_metrics():
+        if backend.processMetrics:
+            print(f"Per-process CPU utilization (%), resident memory (MiB): {backend.processMetrics}", flush=True)
 
-    start = time.time()
-    timeline = []
+    backend.processMetricsChanged.connect(report_metrics)
+    if deadlock:
+        backend.toggleDeadlock()
+        ipc_index = 2
+    backend.start(num_procs, ipc_index)
+    if not backend.running:
+        print(backend.alert or backend.status)
+        return 1
+
+    QTimer.singleShot(round(seconds * 1000), app.quit)
     try:
-        while time.time() - start < seconds:
-            # Drain logs
-            while not log_q.empty():
-                timeline.append(log_q.get())
-            time.sleep(0.05)
+        app.exec()
     finally:
-        for q in control_queues:
-            q.put("STOP")
-        for p in procs:
-            p.join(timeout=1.0)
-            if p.is_alive():
-                p.terminate()
+        backend.stop()
 
-    ts = int(time.time())
-    fname = f"ipcsync_log_{ts}.txt"
-    with open(fname, "w", encoding="utf-8") as f:
-        f.write("\n".join(timeline))
-
-    print(f"Headless run finished; log written to {fname}")
+    if stdout:
+        print(backend.timeline, end="")
+    else:
+        filename = f"ipcsync_log_{int(time.time())}.txt"
+        with open(filename, "w", encoding="utf-8") as log:
+            log.write(backend.timeline)
+        print(f"Headless run finished; log written to {filename}")
+    return 0
 
 
 def parse_args():
-    p = argparse.ArgumentParser(description="Run a short headless IPC simulation")
-    p.add_argument("--procs", type=int, default=3, help="Number of processes to spawn")
-    p.add_argument("--seconds", type=int, default=5, help="How long to run the simulation")
-    p.add_argument("--deadlock", action="store_true", help="Enable deadlock demo mode")
-    return p.parse_args()
+    parser = argparse.ArgumentParser(description="Run a short headless IPC simulation")
+    parser.add_argument("--procs", type=int, default=3, help="Number of workers to spawn")
+    parser.add_argument("--seconds", type=float, default=5, help="Simulation duration")
+    parser.add_argument("--ipc", choices=("pipe", "queue", "shared"), default="queue")
+    parser.add_argument("--deadlock", action="store_true", help="Run the four-worker Shared Memory demo")
+    parser.add_argument("--stdout", action="store_true", help="Print the timeline to standard output")
+    args = parser.parse_args()
+    if args.seconds <= 0:
+        parser.error("--seconds must be positive")
+    return args
 
 
 if __name__ == "__main__":
+    mp.freeze_support()
     args = parse_args()
-    mp.set_start_method("spawn", force=False)
-    run_headless(args.procs, args.seconds, args.deadlock)
+    raise SystemExit(run_headless(args.procs, args.seconds, args.deadlock,
+                                  ("pipe", "queue", "shared").index(args.ipc), args.stdout))
