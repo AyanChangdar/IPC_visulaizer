@@ -6,7 +6,8 @@ from unittest.mock import patch
 import psutil
 from PySide6.QtCore import QCoreApplication
 
-from main import Backend, ProcessMonitor
+from main import Backend
+from simulation import ProcessMonitor
 
 
 def burn_cpu(ready):
@@ -161,7 +162,7 @@ class TestProcessMonitor(unittest.TestCase):
             (psutil.ZombieProcess(101), False, psutil.STATUS_ZOMBIE),
             (psutil.AccessDenied(101), True, None),
         ):
-            with self.subTest(error=error), patch("main.psutil.Process", side_effect=error):
+            with self.subTest(error=error), patch("simulation.psutil.Process", side_effect=error):
                 self.assertEqual(ProcessMonitor().sample([(0, 101, True)]), [{
                     "index": 0, "pid": 101, "cpu": None, "memory": None,
                     "status": status, "alive": alive,

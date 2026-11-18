@@ -1,74 +1,11 @@
 import multiprocessing as mp
 import sys
 import time
-from queue import Empty
-
-import psutil
 from PySide6.QtCore import QObject, Property, QRunnable, QThreadPool, QTimer, Signal, Slot
 from PySide6.QtGui import QGuiApplication
 from PySide6.QtQml import QQmlApplicationEngine
 
-from diagnostics import Diagnostics, LockWait
-from ipc_engine import PipeChannel, QueueChannel, SharedMemoryChannel
-from worker import process_worker
-
-
-def process_record(index, pid, alive):
-    return dict(index=index, pid=pid, cpu=None, memory=None, status=None, alive=alive)
-
-
-class ProcessMonitor:
-    def __init__(self):
-        self.handles = {}
-        self.cpu_primed = set()
-
-    def sample(self, workers):
-        return [self._sample_worker(*worker) for worker in workers]
-
-    def _sample_worker(self, index, pid, alive):
-        record = process_record(index, pid, alive)
-        if not alive:
-            self.handles.pop(pid, None)
-            self.cpu_primed.discard(pid)
-            return record
-
-        try:
-            process = self.handles.get(pid)
-            if process is None:
-                process = self.handles[pid] = psutil.Process(pid)
-            if not process.is_running():
-                record["alive"] = False
-                return record
-
-            with process.oneshot():
-                try:
-                    record["status"] = process.status()
-                except psutil.AccessDenied:
-                    pass
-                if record["status"] == psutil.STATUS_ZOMBIE:
-                    record["alive"] = False
-                    return record
-
-                try:
-                    record["memory"] = process.memory_info().rss / (1024 * 1024)
-                except psutil.AccessDenied:
-                    pass
-                try:
-                    cpu = process.cpu_percent(interval=None)
-                    if pid in self.cpu_primed:
-                        record["cpu"] = cpu
-                    self.cpu_primed.add(pid)
-                except psutil.AccessDenied:
-                    pass
-        except psutil.ZombieProcess:
-            record = process_record(index, pid, False)
-            record["status"] = psutil.STATUS_ZOMBIE
-        except psutil.NoSuchProcess:
-            record = process_record(index, pid, False)
-        except psutil.AccessDenied:
-            pass
-
-        return record
+from simulation import Simulation, SimulationConfigurationError, event_text, process_record, ProcessMonitor
 
 
 class SampleSignals(QObject):
@@ -102,7 +39,7 @@ class Backend(QObject):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self._ctx = mp.get_context("spawn")
+        self.simulation = Simulation()
         self._running = False
         self._status = "Idle"
         self._timeline = "Welcome to IPCSync Debugger!\n"
@@ -115,17 +52,6 @@ class Backend(QObject):
         self._process_metrics = []
         self._monitor = None
         self._sampling = False
-
-        self.processes = []
-        self.log_queue = None
-        self._stop_writers = []
-        self._demo = None
-        self.channel = None
-        self.diagnostics = None
-
-        self.message_count = 0
-        self.total_latency = 0.0
-        self.start_time = 0.0
 
         self.log_timer = QTimer(self)
         self.log_timer.timeout.connect(self.update_logs)
@@ -179,74 +105,51 @@ class Backend(QObject):
     def processMetrics(self):
         return self._process_metrics
 
+    @property
+    def processes(self):
+        return self.simulation.processes
+
+    @property
+    def message_count(self):
+        return self.simulation.message_count
+
     @Slot(int, int)
     def start(self, num_procs: int, ipc_index: int):
         if self._running:
             self.stop()
             return
 
-        ipc_map = {0: PipeChannel, 1: QueueChannel, 2: SharedMemoryChannel}
-        channel_class = ipc_map.get(ipc_index, PipeChannel)
-        if self._deadlock_active and (num_procs < 4 or channel_class is not SharedMemoryChannel):
-            self._set_alert("Deadlock demo requires Shared Memory and at least four workers.")
-            return
-        if num_procs < 1:
-            self.update_status("At least one worker is required.")
-            return
-
-        self._set_alert("")
-        self.message_count = 0
-        self.total_latency = 0.0
-        self._throughput = "Throughput: 0.0 msg/s"
-        self._latency = "Avg. Latency: 0.00 ms"
-        self.metricsChanged.emit()
-        self._frozen_processes = []
-        self.frozenProcessesChanged.emit()
-
+        method = {0: "pipe", 1: "queue", 2: "shared_memory"}.get(ipc_index, "pipe")
         try:
-            self.channel = channel_class(num_procs, self._ctx)
-            self.log_queue = self._ctx.Queue()
-            if self._deadlock_active:
-                self._demo = ((self._ctx.Lock(), self._ctx.Lock()), self._ctx.Barrier(2))
-                self.diagnostics = Diagnostics()
-
-            self._channel_type = self.channel.type_name()
-            self.channelTypeChanged.emit()
-            self._timeline = (
-                f"--- Starting simulation with {num_procs} processes using {self._channel_type} ---\n"
-            )
-            if self._demo:
-                self._timeline += "--- Deadlock demo: P2 and P3 each take one lock ---\n"
-            self.timelineChanged.emit()
-
-            for index in range(num_procs):
-                stop_reader, stop_writer = self._ctx.Pipe(duplex=False)
-                self._stop_writers.append(stop_writer)
-                try:
-                    process = self._ctx.Process(
-                        target=process_worker,
-                        args=(index, num_procs, self.channel, stop_reader, self.log_queue,
-                              self._demo if index in (2, 3) else None),
-                        daemon=True,
-                    )
-                    process.start()
-                    self.processes.append(process)
-                finally:
-                    stop_reader.close()
+            self.simulation.start(num_procs, method, self._deadlock_active)
+        except SimulationConfigurationError as exc:
+            self._set_alert(str(exc))
+            return
         except (OSError, RuntimeError, ValueError) as exc:
-            self._stop_workers()
             self.update_status(f"Could not start workers: {exc}")
             return
 
-        self.start_time = time.time()
+        self._set_alert("")
+        self._throughput = "Throughput: 0.0 msg/s"
+        self._latency = "Avg. Latency: 0.00 ms"
+        self.metricsChanged.emit()
+        self._channel_type = self.simulation.channel.type_name()
+        self.channelTypeChanged.emit()
+        self._timeline = (
+            f"--- Starting simulation with {num_procs} processes using {self._channel_type} ---\n"
+        )
+        if self._deadlock_active:
+            self._timeline += "--- Deadlock demo: P2 and P3 each take one lock ---\n"
+        self.timelineChanged.emit()
+
         self._running = True
         self._monitor = ProcessMonitor()
-        self._process_metrics = [process_record(*worker) for worker in self._worker_snapshot()]
+        self._process_metrics = [process_record(*worker) for worker in self.simulation.worker_snapshot()]
         self.processMetricsChanged.emit()
         self._request_process_sample()
         self.process_timer.start()
         self.runningChanged.emit()
-        self.update_status("Running deadlock demo..." if self._demo else "Running...")
+        self.update_status("Running deadlock demo..." if self._deadlock_active else "Running...")
 
     @Slot()
     def stop(self):
@@ -257,7 +160,8 @@ class Backend(QObject):
         self.process_timer.stop()
         self._monitor = None
         self._sampling = False
-        self._stop_workers()
+        self.update_logs()
+        self._append_timeline(self.simulation.stop())
 
         self._process_metrics = []
         self.processMetricsChanged.emit()
@@ -274,39 +178,6 @@ class Backend(QObject):
         self._running = False
         self.runningChanged.emit()
         self.update_status("Idle")
-
-    def _stop_workers(self):
-        for writer in self._stop_writers:
-            writer.close()
-        self._stop_writers.clear()
-
-        # Give cooperative workers one shared grace period and drain their log feeds.
-        deadline = time.monotonic() + 0.35
-        while any(process.is_alive() for process in self.processes) and time.monotonic() < deadline:
-            self.update_logs()
-            time.sleep(0.01)
-        self.update_logs()
-
-        for process in self.processes:
-            if process.is_alive():
-                process.terminate()
-        deadline = time.monotonic() + 1
-        for process in self.processes:
-            process.join(timeout=max(0, deadline - time.monotonic()))
-            if process.is_alive():
-                process.kill()
-                process.join()
-            process.close()
-
-        self.processes.clear()
-        if self.log_queue is not None:
-            self.log_queue.close()
-            self.log_queue = None
-        if self.channel is not None:
-            self.channel.close()
-            self.channel = None
-        self._demo = None
-        self.diagnostics = None
 
     @Slot()
     def exportLog(self):
@@ -329,17 +200,13 @@ class Backend(QObject):
         self._set_alert("")
         self.update_status("Deadlock mode ON" if self._deadlock_active else "Deadlock mode OFF")
 
-    def _worker_snapshot(self):
-        return [(index, process.pid, process.exitcode is None)
-                for index, process in enumerate(self.processes)]
-
     @Slot()
     def _request_process_sample(self):
         if self._monitor is None or self._sampling:
             return
 
         self._sampling = True
-        task = SampleProcesses(self._monitor, self._worker_snapshot())
+        task = SampleProcesses(self._monitor, self.simulation.worker_snapshot())
         task.signals.ready.connect(self._publish_process_sample)
         QThreadPool.globalInstance().start(task)
 
@@ -363,59 +230,37 @@ class Backend(QObject):
             self.alertChanged.emit()
 
     def update_logs(self):
-        if self.log_queue is None:
-            return
+        self._append_timeline(self.simulation.poll_events())
 
-        lines = []
-        for _ in range(256):
-            try:
-                event = self.log_queue.get_nowait()
-            except (Empty, EOFError, OSError):
-                break
-
-            if isinstance(event, LockWait):
-                lines.append(f"[P{event.index}] Waiting for Lock {event.requested} while holding Lock {event.held}.")
-                if self.diagnostics is not None:
-                    self.diagnostics.record_wait(event)
-            elif isinstance(event, str):
-                lines.append(event)
-            else:
-                message, latency = event
-                self.total_latency += latency
-                self.message_count += 1
-                lines.append(f"[P{message.dst}] Received {message.data!r} from P{message.src}, latency={latency:.4f}s")
+    def _append_timeline(self, events):
+        lines = [event_text(event) for event in events]
+        for event in events:
+            if isinstance(event, tuple):
+                message, _ = event
                 self.dataFlow.emit(message.src, message.dst)
 
-        self._update_deadlock(lines)
+        diagnostics = self.simulation.diagnostics
+        if diagnostics is not None:
+            if diagnostics.blocked != self._frozen_processes:
+                self._frozen_processes = diagnostics.blocked
+                self.frozenProcessesChanged.emit()
+            if diagnostics.alert and diagnostics.alert != self._alert:
+                lines.append(diagnostics.alert)
+            self._set_alert(diagnostics.alert)
         if lines:
             self._timeline += "\n".join(lines) + "\n"
             self.timelineChanged.emit()
-
-    def _update_deadlock(self, lines):
-        if self.diagnostics is None:
-            return
-
-        alive = {index for index, _, alive in self._worker_snapshot() if alive}
-        self.diagnostics.retain_workers(alive)
-        if self.diagnostics.blocked != self._frozen_processes:
-            self._frozen_processes = self.diagnostics.blocked
-            self.frozenProcessesChanged.emit()
-        if self.diagnostics.alert and self.diagnostics.alert != self._alert:
-            lines.append(self.diagnostics.alert)
-        self._set_alert(self.diagnostics.alert)
 
     def update_stats(self):
         if not self._running:
             return
 
-        if self.diagnostics is None:
-            self.update_status(self.channel.status())
-        elapsed = time.time() - self.start_time
-        if elapsed > 0:
-            self._throughput = f"Throughput: {self.message_count / elapsed:.1f} msg/s"
-            latency = 1000 * self.total_latency / self.message_count if self.message_count else 0.0
-            self._latency = f"Avg. Latency: {latency:.2f} ms"
-            self.metricsChanged.emit()
+        if self.simulation.diagnostics is None:
+            self.update_status(self.simulation.channel.status())
+        performance = self.simulation.performance()
+        self._throughput = f"Throughput: {performance['throughput']:.1f} msg/s"
+        self._latency = f"Avg. Latency: {performance['average_latency_ms']:.2f} ms"
+        self.metricsChanged.emit()
 
 
 def main():

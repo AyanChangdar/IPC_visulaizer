@@ -4,7 +4,7 @@ import random
 import time
 from multiprocessing.connection import wait
 
-from diagnostics import LockWait
+from diagnostics import LockAcquired, LockWait
 
 
 def process_worker(index, num_procs, channel, stop_reader, log_queue, deadlock=None):
@@ -19,7 +19,7 @@ def process_worker(index, num_procs, channel, stop_reader, log_queue, deadlock=N
         first, second = "AB"[own], "AB"[other]
 
         with locks[own]:
-            log(f"Acquired Lock {first}.")
+            log_queue.put(LockAcquired(index, first))
             both_holding.wait()
             if not locks[other].acquire(block=False):
                 log_queue.put(LockWait(index, first, second))
